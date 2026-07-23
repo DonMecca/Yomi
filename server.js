@@ -32,7 +32,8 @@ app.use(express.static(path.join(__dirname, "public")));
 app.use(express.static(path.join(__dirname, "static")));
 
 const port = process.env.PORT || 7000;
-let BASE_URL = process.env.BASE_URL || "http://127.0.0.1:7000";
+// Prefer explicit BASE_URL, then Render's public URL, then localhost.
+let BASE_URL = process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || "http://127.0.0.1:7000";
 BASE_URL = BASE_URL.replace(/\/+$/, "");
 
 // Health check endpoint for container orchestrators

@@ -1,0 +1,6 @@
+node_modules/
+aod-cache.json
+.env
+.DS_Store
+static/waiting.mp4
+static/archive.mp4

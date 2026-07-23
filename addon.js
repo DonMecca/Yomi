@@ -16,7 +16,7 @@ const { checkRD, checkTorbox, getActiveRD, getActiveTorbox } = require("./lib/de
 const { extractEpisodeNumber, getBatchRange, isEpisodeMatch, selectBestVideoFile, isSeasonBatch, verifyTitleMatch } = require("./lib/parser");
 const { getAliasesByAniListId, getAliasesByTitle } = require("./lib/aod");
 
-let BASE_URL = process.env.BASE_URL || "http://127.0.0.1:7000";
+let BASE_URL = process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || "http://127.0.0.1:7000";
 BASE_URL = BASE_URL.replace(/\/+$/, "");
 const INTERNAL_TB_KEY = process.env.INTERNAL_TORBOX_KEY || "";
 const KNOWN_ALIASES = { "hamehara": "Harem Hamehara" };

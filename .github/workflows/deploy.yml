@@ -31,4 +31,4 @@ jobs:
           context: .
           push: true
           no-cache: true
-          tags: ghcr.io/mralanbourne/yomi:latest
+          tags: ghcr.io/donmecca/yomi:latest

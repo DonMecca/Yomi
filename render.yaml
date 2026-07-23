@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: yomi-addon
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm install --omit=dev && mkdir -p static && curl -fsSL -o static/waiting.mp4 https://github.com/mralanbourne/Yomi/releases/download/video/waiting.mp4 && curl -fsSL -o static/archive.mp4 https://github.com/mralanbourne/Yomi/releases/download/video/archive.mp4
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
