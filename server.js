@@ -16,6 +16,20 @@ const app = express();
 app.use(express.json()); 
 
 //===============
+// PRIVACY / ACCESS
+//===============
+const {
+  createNoIndexMiddleware,
+  createRobotsHandler,
+  createAccessSecretMiddleware,
+  createConfigurePasswordMiddleware
+} = require("./lib/privacy_middleware");
+app.use(createNoIndexMiddleware());
+app.use(createAccessSecretMiddleware());
+app.use(createConfigurePasswordMiddleware());
+app.get("/robots.txt", createRobotsHandler());
+
+//===============
 // CORS HEADERS
 // Enforces broad CORS rules to allow the Stremio Web UI to fetch resources without preflight blocking.
 //===============
