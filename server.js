@@ -15,6 +15,14 @@ const { selectBestVideoFile } = require("./lib/parser");
 const app = express();
 app.use(express.json()); 
 
+// Bound every outbound call by default. Debrid and provider APIs are called
+// throughout this file, and axios applies NO timeout unless one is asked for, so a
+// stalled connection held /resolve (the player's redirect) or /sub open
+// indefinitely — the player simply hangs. Sites that need longer set their own.
+axios.defaults.timeout = 15000;
+// Subtitle bodies come off a CDN and can legitimately take longer than an API hop.
+const SUBTITLE_STREAM_TIMEOUT_MS = 45000;
+
 //===============
 // PRIVACY / ACCESS
 //===============
@@ -190,7 +198,7 @@ app.get("/sub/:provider/:apiKey/:hash/:fileId", async (req, res) => {
         
         if (!downloadUrl) return res.status(404).send("Subtitle not found");
         
-        const subResponse = await axios.get(downloadUrl, { responseType: "stream" });
+        const subResponse = await axios.get(downloadUrl, { responseType: "stream", timeout: SUBTITLE_STREAM_TIMEOUT_MS });
         if (clientAborted) { if (subResponse.data?.destroy) subResponse.data.destroy(); return; }
 
         const ext = fileName.split(".").pop().toLowerCase();

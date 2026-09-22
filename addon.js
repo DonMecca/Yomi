@@ -21,6 +21,36 @@ BASE_URL = BASE_URL.replace(/\/+$/, "");
 const INTERNAL_TB_KEY = process.env.INTERNAL_TORBOX_KEY || "";
 const KNOWN_ALIASES = { "hamehara": "Harem Hamehara" };
 
+// How long decorative enrichment may delay a response. Progress percentages and
+// episode titles only decorate the UI, so a slow third-party round-trip must not
+// hold back the payload that is actually being asked for.
+const PROGRESS_BUDGET_MS = 1500;
+const EPISODE_TITLE_BUDGET_MS = 2500;
+
+/**
+ * Resolve `promise`, but give up after `ms` and use `fallback` instead of waiting.
+ * Not a cancellation: the underlying request finishes and its result is discarded.
+ */
+function withDeadline(promise, ms, fallback) {
+    return Promise.race([
+        promise.catch(() => fallback),
+        new Promise(resolve => {
+            const timer = setTimeout(() => resolve(fallback), ms);
+            if (timer && typeof timer.unref === "function") timer.unref();
+        })
+    ]);
+}
+
+/**
+ * A catalog whose metas are empty is almost always a transient upstream failure
+ * (AniList/Jikan blip, or a failed scrape), so it must not be cached for hours.
+ * Retry quickly when empty, cache long when populated — the same rule the search
+ * catalog already used.
+ */
+function catalogResponse(metas, populatedTtl) {
+    return { metas, cacheMaxAge: metas.length === 0 ? 60 : populatedTtl };
+}
+
 //===============
 // BASE64 UTILITY FUNCTIONS
 // These functions safely encode and decode strings to Base64.
@@ -217,9 +247,9 @@ function generateDynamicPoster(title) {
 //===============
 builder.defineCatalogHandler(async ({ type, id, extra, config }) => {
     const userConfig = parseConfig(config);
-    if (id === "sukebei_latest" && userConfig.showLatest !== false) return { metas: applyTitlePreference((await getLatestAdultAnime()).map(m => ({ ...m, type: "anime" })), userConfig), cacheMaxAge: 14400 };
-    if (id === "sukebei_trending" && userConfig.showTrending !== false) return { metas: applyTitlePreference((await getTrendingAdultAnime()).map(m => ({ ...m, type: "anime" })), userConfig), cacheMaxAge: 43200 };
-    if (id === "sukebei_top" && userConfig.showTop !== false) return { metas: applyTitlePreference((await getTopAdultAnime()).map(m => ({ ...m, type: "anime" })), userConfig), cacheMaxAge: 43200 };
+    if (id === "sukebei_latest" && userConfig.showLatest !== false) return catalogResponse(applyTitlePreference((await getLatestAdultAnime()).map(m => ({ ...m, type: "anime" })), userConfig), 14400);
+    if (id === "sukebei_trending" && userConfig.showTrending !== false) return catalogResponse(applyTitlePreference((await getTrendingAdultAnime()).map(m => ({ ...m, type: "anime" })), userConfig), 43200);
+    if (id === "sukebei_top" && userConfig.showTop !== false) return catalogResponse(applyTitlePreference((await getTopAdultAnime()).map(m => ({ ...m, type: "anime" })), userConfig), 43200);
     
     if (id === "sukebei_search" && extra.search) {
         let cleanQuery = sanitizeSearchQuery(extra.search);
@@ -264,6 +294,10 @@ builder.defineMetaHandler(async ({ type, id, config }) => {
     const userConfig = parseConfig(config);
     if (!id.startsWith("anilist:") && !id.startsWith("sukebei:")) return Promise.resolve({ meta: null });
     let meta = null, searchTitle = "";
+    // Distinguishes a real upstream lookup from a placeholder built when AniList/
+    // Jikan returned nothing. A placeholder is a transient failure, not metadata,
+    // so it must not be handed to the client with a multi-day cache lifetime.
+    let metaFromUpstream = false;
     try {
         if (id.startsWith("anilist:")) {
             let aniListId = id.split(":")[1];
@@ -273,6 +307,7 @@ builder.defineMetaHandler(async ({ type, id, config }) => {
                 let clonedMeta = { ...rawMeta, id }; 
                 if (userConfig.useEnglishTitles && clonedMeta.englishName) clonedMeta.name = clonedMeta.englishName;
                 meta = clonedMeta;
+                metaFromUpstream = true;
             } 
             else { meta = { id, type: "anime", name: "Unknown", poster: generateDynamicPoster("Unknown"), baseTime: Date.now(), epMeta: {} }; }
         } else if (id.startsWith("sukebei:")) {
@@ -283,6 +318,7 @@ builder.defineMetaHandler(async ({ type, id, config }) => {
                 let clonedMeta = { id, type: "anime", name: malData.name || searchTitle.replace(/^\[.*?\]\s*/g, "").trim(), englishName: malData.englishName, poster: malData.poster || generateDynamicPoster(searchTitle), background: malData.background, description: malData.description, releaseInfo: malData.releaseInfo, released: malData.released, episodes: malData.episodes, baseTime: malData.baseTime, epMeta: {} };
                 if (userConfig.useEnglishTitles && clonedMeta.englishName) clonedMeta.name = clonedMeta.englishName;
                 meta = clonedMeta;
+                metaFromUpstream = true;
             } 
             else { meta = { id, type: "anime", name: searchTitle.replace(/^\[.*?\]\s*/g, "").trim(), poster: generateDynamicPoster(searchTitle), baseTime: Date.now(), epMeta: {} }; }
         }
@@ -313,7 +349,10 @@ builder.defineMetaHandler(async ({ type, id, config }) => {
         
         const videos = [];
         const episodeThumbnail = meta.background || meta.poster || "https://dummyimage.com/600x337/1a1a1a/e91e63.png?text=YOMI+EPISODE";
-        const jikanEps = meta.idMal ? await fetchEpisodeDetails(meta.idMal) : {};
+        // Bounded: Jikan fetches up to ~4 pages for episode titles, which previously
+        // sat on the critical path. On timeout the episodes still render with the
+        // generated titles below.
+        const jikanEps = meta.idMal ? await withDeadline(fetchEpisodeDetails(meta.idMal), EPISODE_TITLE_BUDGET_MS, {}) : {};
         const baseTime = meta.baseTime || Date.now();
         const epMeta = meta.epMeta || {};
         const nextAiring = meta.nextAiringEpisode;
@@ -331,7 +370,11 @@ builder.defineMetaHandler(async ({ type, id, config }) => {
             videos.push({ id: meta.id + ":" + 1 + ":" + i, title: finalTitle, season: 1, episode: i, released: finalDate, thumbnail: epData.thumbnail || episodeThumbnail });
         }
         meta.videos = videos;
-        return { meta, cacheMaxAge: 604800 };
+        // Only real metadata earns the long client cache. A placeholder built after
+        // an upstream failure used to be handed over with a WEEK-long cacheMaxAge,
+        // so one AniList/Jikan blip left the item stuck as "Unknown" with no usable
+        // episodes for seven days.
+        return { meta, cacheMaxAge: metaFromUpstream ? 604800 : 60 };
     } catch (err) {
         return { meta: { id, type: "anime", name: "Error", poster: generateDynamicPoster("Error") }, cacheMaxAge: 60 };
     }
@@ -575,10 +618,13 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
         const [rdC, tbC, rdA, tbA] = await Promise.all([
             userConfig.rdKey ? checkRD(hashes, userConfig.rdKey).catch(() => ({})) : Promise.resolve({}),
             tbKeyToUse ? checkTorbox(hashes, tbKeyToUse).catch(() => ({})) : Promise.resolve({}),
-            userConfig.rdKey ? getActiveRD(userConfig.rdKey).catch(() => ({})) : Promise.resolve({}),
+            // Progress feeds the `_prog` label and the sort order only. Both used to
+            // sit unbounded in this Promise.all, so an 8s debrid round-trip delayed
+            // the entire stream list. Missing progress just renders without it.
+            userConfig.rdKey ? withDeadline(getActiveRD(userConfig.rdKey), PROGRESS_BUDGET_MS, {}) : Promise.resolve({}),
             // Use tbKeyToUse, not userConfig.tbKey: the internal key must reach the
             // poller too, or cached-detection works but progress never polls.
-            tbKeyToUse ? getActiveTorbox(tbKeyToUse).catch(() => ({})) : Promise.resolve({})
+            tbKeyToUse ? withDeadline(getActiveTorbox(tbKeyToUse), PROGRESS_BUDGET_MS, {}) : Promise.resolve({})
         ]);
         console.log(`[PIPELINE] Debrid query completed.`);
 
