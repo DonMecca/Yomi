@@ -1,0 +1,7 @@
+# Keep the 59MB full Anime Offline Database out of image builds.
+# Only aod-aliases-compact.json (~4MB) is used at runtime; the full file is
+# gitignored but Dockerfile does `COPY . .`, which would bake it in.
+aod-cache.json
+.git
+node_modules
+.render

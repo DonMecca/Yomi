@@ -209,7 +209,9 @@ app.get("/sub/:provider/:apiKey/:hash/:fileId", async (req, res) => {
         res.setHeader("Cache-Control", "public, max-age=86400"); 
         
         subResponse.data.on("error", () => res.end());
-        req.on("close", () => { if (subResponse.data?.destroy) subResponse.data.destroy(); });
+        // res, not req: req's "close" fires when the request body ends, which on
+        // a GET can happen immediately — that would destroy a healthy stream.
+        res.on("close", () => { if (subResponse.data?.destroy) subResponse.data.destroy(); });
         subResponse.data.pipe(res);
     } catch (e) { res.status(500).send("Error fetching subtitle data"); }
 });
@@ -313,6 +315,11 @@ app.get("/resolve/:provider/:apiKey/:hash/:episode?", async (req, res) => {
             return res.redirect(dl.data.data);
         }
     } catch (e) { return serveLoadingVideo(req, res); }
+
+    // Defensive fall-through: the provider branches above are exhaustive today,
+    // but an unrecognised provider would otherwise leave the request hanging
+    // with no response ever sent.
+    if (!res.headersSent) return serveLoadingVideo(req, res);
 });
 
 //===============

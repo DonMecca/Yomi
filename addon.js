@@ -49,7 +49,7 @@ const manifest = {
         { id: "sukebei_latest", type: "anime", name: "Yomi Latest Releases" },
         { id: "sukebei_trending", type: "anime", name: "Yomi Trending" },
         { id: "sukebei_top", type: "anime", name: "Yomi Top Rated" },
-        { id: "sukebei_search", type: "anime", name: "Yomi Search", extra: [{ name: "search", isRequired: true }] }
+        { id: "sukebei_search", type: "anime", name: "Yomi Search", extra: [{ name: "search", isRequired: true }, { name: "skip", isRequired: false }] }
     ],
     config: [{ key: "Yomi", type: "text", title: "Yomi Internal Payload", required: false }],
     behaviorHints: { configurable: true, configurationRequired: true },
@@ -90,13 +90,16 @@ function applyTitlePreference(metas, userConfig) {
 //===============
 function parseSizeToBytes(sizeStr) {
     if (!sizeStr || typeof sizeStr !== "string") return 0;
-    const match = sizeStr.match(/([\d.]+)\s*(GB|MB|KB|GiB|MiB|KiB|B)/i);
+    // TB was missing from the unit list, so "1.5 TiB" parsed as 0 bytes and
+    // slipped past the per-file size cap (which compares against ~4.5GB).
+    const match = sizeStr.match(/([\d.]+)\s*(TB|TiB|GB|GiB|MB|MiB|KB|KiB|B)\b/i);
     if (!match) return 0;
     const val = parseFloat(match[1]);
     const unit = match[2].toUpperCase();
-    if (unit.includes("G")) return val * 1024 * 1024 * 1024;
-    if (unit.includes("M")) return val * 1024 * 1024;
-    if (unit.includes("K")) return val * 1024;
+    if (unit.startsWith("T")) return val * 1024 * 1024 * 1024 * 1024;
+    if (unit.startsWith("G")) return val * 1024 * 1024 * 1024;
+    if (unit.startsWith("M")) return val * 1024 * 1024;
+    if (unit.startsWith("K")) return val * 1024;
     return val;
 }
 
@@ -224,7 +227,9 @@ builder.defineCatalogHandler(async ({ type, id, extra, config }) => {
         if (KNOWN_ALIASES[lowerQuery]) cleanQuery = KNOWN_ALIASES[lowerQuery];
         
         const [anilistMetas, sukebeiTorrents] = await Promise.all([searchAdultAnime(extra.search), searchSukebeiForHentai(cleanQuery)]);
-        const finalMetas = anilistMetas.map(m => { m.type = "anime"; return m; });
+        // Copy before annotating: these objects are shared with the AniList cache
+        // (6h TTL), so mutating `m.type` in place poisoned the cache for all users.
+        const finalMetas = anilistMetas.map(m => ({ ...m, type: "anime" }));
         const rawGroups = {};
         
         sukebeiTorrents.forEach(t => {
@@ -237,7 +242,15 @@ builder.defineCatalogHandler(async ({ type, id, extra, config }) => {
                 finalMetas.push({ id: "sukebei:" + toBase64Safe(cleanName), type: "anime", name: cleanName.replace(/^\[.*?\]\s*/g, "").trim(), poster: generateDynamicPoster(cleanName) });
             }
         });
-        return { metas: applyTitlePreference(finalMetas, userConfig), cacheMaxAge: finalMetas.length === 0 ? 60 : 86400 };
+
+        // Honour `skip` so Stremio's infinite scroll advances instead of
+        // re-serving the same page. The upstream query is fixed, so this pages
+        // over the assembled list rather than fetching more.
+        const skip = Math.max(0, parseInt(extra.skip, 10) || 0);
+        const PAGE_SIZE = 30;
+        const preferred = applyTitlePreference(finalMetas, userConfig);
+        const paged = preferred.slice(skip, skip + PAGE_SIZE);
+        return { metas: paged, cacheMaxAge: finalMetas.length === 0 ? 60 : 86400 };
     }
     return { metas: [] };
 });
@@ -364,15 +377,15 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
                 if (freshMeta) searchTitle = sanitizeSearchQuery(freshMeta.name);
             }
         } else if (id.startsWith("sukebei:")) {
-            let payload = parts[1];
-            if (payload && payload.includes("-")) {
-                let subParts = payload.split("-");
-                searchTitle = sanitizeSearchQuery(fromBase64Safe(subParts[0]));
-                requestedEp = parseInt(subParts[1], 10) || 1;
-            } else {
-                searchTitle = sanitizeSearchQuery(fromBase64Safe(payload));
-                requestedEp = parts.length > 2 ? parseInt(parts[parts.length - 1], 10) : 1;
-            }
+            // Format is "sukebei:<base64-safed title>" for catalog items, and
+            // "sukebei:<base64>:<season>:<episode>" for episode videos (see the
+            // videos.push at the meta handler). The episode comes from the colon
+            // segments — NOT from splitting the payload on "-", because base64url
+            // uses "-" as a data character. Splitting on it truncated the title
+            // (e.g. "W-ahnOm..." decoded to just "W") for roughly 1 in 15 items.
+            const payload = parts[1] || "";
+            searchTitle = sanitizeSearchQuery(fromBase64Safe(payload));
+            requestedEp = parts.length > 2 ? (parseInt(parts[parts.length - 1], 10) || 1) : 1;
         } else if (id.startsWith("kitsu:")) {
             try {
                 const res = await axios.get(`https://anime-kitsu.strem.fun/meta/anime/${parts[0] + ":" + parts[1]}.json`, { timeout: 4000 });
@@ -469,8 +482,13 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
         // FILTER 1: Title cleanup & Resolution matching
         // Drops torrents that are manga, artbooks, wrong resolution, or invalid size.
         //===============
-        let dropsByTitle = 0, dropsBySize = 0, dropsByRes = 0;
+        let dropsByTitle = 0, dropsBySize = 0, dropsByRes = 0, dropsByCategory = 0;
         let validTorrents = torrents.filter(t => {
+            // Sukebei category: 1_x is Art/Anime (what we want); 2_x is Real Life
+            // (JAV/live-action) which does not belong in an anime addon. Only
+            // applied when the feed actually reported a category.
+            if (t.categoryId && /^2_/.test(t.categoryId)) { dropsByCategory++; return false; }
+
             if (/\b(?:同人誌|同人CG集|Doujinshi|Manga|Artbook|Pictures|Images|CG集|Novel|Photobook|Cosplay)\b/i.test(t.title)) { dropsByTitle++; return false; }
             
             const { res } = extractTags(t.title);
@@ -502,12 +520,23 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 
             const searchCandidates = Array.from(fallbackSearchQueries).filter(t => t.length > 4 && !t.includes("Episode")).slice(0, 2);
 
-            for (const altTitle of searchCandidates) {
-                let d = extractSeason(altTitle);
-                if (d && d > 1 && expectedSeason === 1) expectedSeason = d;
+            // Run the fallback searches concurrently. They are independent
+            // upstream queries, and awaiting them in sequence made the worst case
+            // additive (~14s each => ~42s cold). Results are merged in candidate
+            // order afterwards so the outcome is unchanged.
+            const fallbackResults = await Promise.all(searchCandidates.map(async (altTitle) => {
+                const d = extractSeason(altTitle);
+                try {
+                    const extraTorrents = await searchSukebeiForHentai(sanitizeSearchQuery(altTitle));
+                    return { altTitle, seasonHint: d, extraTorrents };
+                } catch (e) {
+                    return { altTitle, seasonHint: d, extraTorrents: [] };
+                }
+            }));
 
-                const extraTorrents = await searchSukebeiForHentai(sanitizeSearchQuery(altTitle));
-                
+            for (const { altTitle, seasonHint, extraTorrents } of fallbackResults) {
+                if (seasonHint && seasonHint > 1 && expectedSeason === 1) expectedSeason = seasonHint;
+
                 let extraDropTitle = 0, extraDropRes = 0;
                 const extraValid = extraTorrents.filter(t => {
                     if (/\b(?:同人誌|同人CG集|Doujinshi|Manga|Artbook|Pictures|Images|CG集|Novel|Photobook|Cosplay)\b/i.test(t.title)) return false;
@@ -547,7 +576,9 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
             userConfig.rdKey ? checkRD(hashes, userConfig.rdKey).catch(() => ({})) : Promise.resolve({}),
             tbKeyToUse ? checkTorbox(hashes, tbKeyToUse).catch(() => ({})) : Promise.resolve({}),
             userConfig.rdKey ? getActiveRD(userConfig.rdKey).catch(() => ({})) : Promise.resolve({}),
-            userConfig.tbKey ? getActiveTorbox(userConfig.tbKey).catch(() => ({})) : Promise.resolve({})
+            // Use tbKeyToUse, not userConfig.tbKey: the internal key must reach the
+            // poller too, or cached-detection works but progress never polls.
+            tbKeyToUse ? getActiveTorbox(tbKeyToUse).catch(() => ({})) : Promise.resolve({})
         ]);
         console.log(`[PIPELINE] Debrid query completed.`);
 
@@ -674,7 +705,7 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
                         description: `${flags[streamLang] || "🇬🇧"} | ${censorData.label}${batchStr}\n${streamStatus}\n📄 ${t.title}\n💾 ${t.size} | 👥 ${seeders} Seeds`, 
                         url: BASE_URL + "/resolve/torbox/" + userConfig.tbKey + "/" + t.hash + "/" + requestedEp, 
                         behaviorHints: { bingeGroup: (isCached ? "tb_" : "dl_") + t.hash, notWebReady: !isCached }, 
-                        _bytes: bytes, streamLang, _isCached: isCached, _res: res, _prog: progTB || 0, _seeders: seeders, _isBatch: isBatch, _isUncensored: censorData.isUncensored
+                        _bytes: bytes, _lang: streamLang, _isCached: isCached, _res: res, _prog: progTB || 0, _seeders: seeders, _isBatch: isBatch, _isUncensored: censorData.isUncensored
                     };
                     
                     if (isCached && filesTB) {
