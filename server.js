@@ -88,8 +88,10 @@ app.get("/configure", (req, res) => {
 app.get("/:config?/manifest.json", (req, res) => {
     let userConfig = {};
     let isConfigured = false;
+    let configProvided = false;
 
     if (req.params.config) {
+        configProvided = true;
         try {
             const parsed = JSON.parse(decodeURIComponent(req.params.config));
             userConfig = parseConfig(parsed);
@@ -114,7 +116,16 @@ app.get("/:config?/manifest.json", (req, res) => {
         return true;
     });
 
-    res.setHeader("Cache-Control", "max-age=86400, public");
+    // The response depends on the URL-embedded user config (which catalogs are
+    // enabled), so it must not be publicly cached for a day: a shared cache
+    // would serve one user's manifest to another, and an unparseable config
+    // would be cached as a full-catalog manifest. Keep the unconfigured manifest
+    // cacheable; make per-config responses short-lived and private.
+    if (configProvided) {
+        res.setHeader("Cache-Control", "private, max-age=300");
+    } else {
+        res.setHeader("Cache-Control", "max-age=3600, public");
+    }
     res.json(dynamicManifest);
 });
 
@@ -302,6 +313,19 @@ app.get("/resolve/:provider/:apiKey/:hash/:episode?", async (req, res) => {
             return res.redirect(dl.data.data);
         }
     } catch (e) { return serveLoadingVideo(req, res); }
+});
+
+//===============
+// PROCESS-LEVEL SAFETY
+// This service is a single instance on a memory-capped free tier. On Node >=15
+// an unhandled rejection exits the process, so one stray async throw from any
+// provider takes every addon route down with it until Render restarts.
+//===============
+process.on("unhandledRejection", (reason) => {
+    console.error("[YOMI] Unhandled rejection:", reason && reason.message ? reason.message : reason);
+});
+process.on("uncaughtException", (err) => {
+    console.error("[YOMI] Uncaught exception:", err && err.message ? err.message : err);
 });
 
 app.use("/", getRouter(addonInterface));
